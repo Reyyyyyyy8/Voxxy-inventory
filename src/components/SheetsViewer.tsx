@@ -31,11 +31,8 @@ import {
   AlertTriangle,
   RefreshCw
 } from 'lucide-react';
-import { 
-  DEFAULT_SUPABASE_PUB_KEY, 
-  DEFAULT_SUPABASE_SEC_KEY, 
-  SUPABASE_SCHEMA_SQL 
-} from '../utils/supabaseSync';
+import { SUPABASE_SCHEMA_SQL } from '../utils/supabaseSchema';
+import { apiFetch } from '../utils/api';
 
 interface SheetsViewerProps {
   assets: Asset[];
@@ -60,16 +57,10 @@ export const SheetsViewer: React.FC<SheetsViewerProps> = ({
 }) => {
   const [activeSheetTab, setActiveSheetTab] = useState<'ASET' | 'HANDOVER' | 'LOG' | 'MASTER' | 'SUPABASE'>('SUPABASE');
   const [sheetUrlInput, setSheetUrlInput] = useState(config.googleSheetsUrl || '');
-  const [pinInput, setPinInput] = useState(config.adminPin || '');
-  const [emailsInput, setEmailsInput] = useState(config.adminEmails.join(', '));
   const [logoUrlInput, setLogoUrlInput] = useState(config.logoUrl || '');
   const [saveSuccessMsg, setSaveSuccessMsg] = useState(false);
 
   // Supabase Cloud State
-  const [supabaseUrlInput, setSupabaseUrlInput] = useState(config.supabaseUrl || '');
-  const [supabasePubKeyInput, setSupabasePubKeyInput] = useState(config.supabasePublishableKey || DEFAULT_SUPABASE_PUB_KEY);
-  const [supabaseSecKeyInput, setSupabaseSecKeyInput] = useState(config.supabaseSecretKey || DEFAULT_SUPABASE_SEC_KEY);
-  const [showSecretKey, setShowSecretKey] = useState(false);
   const [isCheckingSupabase, setIsCheckingSupabase] = useState(false);
   const [supabaseStatusInfo, setSupabaseStatusInfo] = useState<{
     configured: boolean;
@@ -89,15 +80,12 @@ export const SheetsViewer: React.FC<SheetsViewerProps> = ({
   const fetchSupabaseStatus = async () => {
     setIsCheckingSupabase(true);
     try {
-      const res = await fetch('/api/supabase/status');
+      const res = await apiFetch('/api/supabase/status');
       const data = await res.json();
       setSupabaseStatusInfo(data);
-      if (data.url && !supabaseUrlInput) setSupabaseUrlInput(data.url);
-      if (data.publishableKey) setSupabasePubKeyInput(data.publishableKey);
-      if (data.secretKey) setSupabaseSecKeyInput(data.secretKey);
     } catch (err: any) {
       setSupabaseStatusInfo({
-        configured: Boolean(config.supabaseUrl),
+        configured: false,
         connected: false,
         message: 'Tidak dapat menjangkau server API: ' + (err.message || 'Error')
       });
@@ -110,63 +98,15 @@ export const SheetsViewer: React.FC<SheetsViewerProps> = ({
     fetchSupabaseStatus();
   }, []);
 
-  // Simpan & Hubungkan Supabase
-  const handleSaveSupabaseConfig = async (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
-    setIsCheckingSupabase(true);
-    setSupabaseActionMsg(null);
-
-    const updatedConfig: SystemConfig = {
-      ...config,
-      supabaseUrl: supabaseUrlInput.trim(),
-      supabasePublishableKey: supabasePubKeyInput.trim() || DEFAULT_SUPABASE_PUB_KEY,
-      supabaseSecretKey: supabaseSecKeyInput.trim() || DEFAULT_SUPABASE_SEC_KEY
-    };
-
-    try {
-      const res = await fetch('/api/supabase/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          supabaseUrl: updatedConfig.supabaseUrl,
-          supabasePublishableKey: updatedConfig.supabasePublishableKey,
-          supabaseSecretKey: updatedConfig.supabaseSecretKey,
-          pin: config.adminPin || ''
-        })
-      });
-      const data = await res.json();
-      onUpdateConfig(updatedConfig);
-      setSupabaseStatusInfo({
-        configured: Boolean(updatedConfig.supabaseUrl),
-        connected: Boolean(data.connected),
-        message: data.message || (data.connected ? 'Berhasil terhubung ke Supabase Cloud!' : 'Konfigurasi tersimpan.'),
-        tables: data.tables
-      });
-      setSupabaseActionMsg({
-        text: data.connected ? 'Tersambung ke Supabase Cloud!' : (data.message || 'Konfigurasi tersimpan.'),
-        isError: !data.connected && Boolean(updatedConfig.supabaseUrl)
-      });
-    } catch (err: any) {
-      onUpdateConfig(updatedConfig);
-      setSupabaseActionMsg({
-        text: 'Konfigurasi disimpan di cache lokal: ' + err.message,
-        isError: true
-      });
-    } finally {
-      setIsCheckingSupabase(false);
-      setTimeout(() => setSupabaseActionMsg(null), 6000);
-    }
-  };
-
   // Push Semua Data Lokal ke Supabase
   const handlePushToSupabase = async () => {
     setIsPushingSupabase(true);
     setSupabaseActionMsg(null);
     try {
-      const res = await fetch('/api/supabase/push-all', {
+      const res = await apiFetch('/api/supabase/push-all', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pin: config.adminPin || '' })
+        body: JSON.stringify({})
       });
       const data = await res.json();
       setSupabaseActionMsg({
@@ -187,10 +127,10 @@ export const SheetsViewer: React.FC<SheetsViewerProps> = ({
     setIsPullingSupabase(true);
     setSupabaseActionMsg(null);
     try {
-      const res = await fetch('/api/supabase/pull-all', {
+      const res = await apiFetch('/api/supabase/pull-all', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pin: config.adminPin || '' })
+        body: JSON.stringify({})
       });
       const data = await res.json();
       setSupabaseActionMsg({
@@ -308,15 +248,8 @@ export const SheetsViewer: React.FC<SheetsViewerProps> = ({
 
   const handleSaveSettings = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    const parsedEmails = emailsInput
-      .split(',')
-      .map(e => e.trim())
-      .filter(e => e.length > 0);
-
     const updatedConfig: SystemConfig = {
       ...config,
-      adminPin: pinInput.trim() || '',
-      adminEmails: parsedEmails,
       googleSheetsUrl: sheetUrlInput.trim(),
       logoUrl: logoUrlInput.trim()
     };
@@ -526,14 +459,14 @@ export const SheetsViewer: React.FC<SheetsViewerProps> = ({
               <div className={`p-4 rounded-2xl border flex flex-wrap items-center justify-between gap-3 ${
                 supabaseStatusInfo?.connected 
                   ? 'bg-emerald-950/30 border-emerald-500/40 text-emerald-300' 
-                  : supabaseUrlInput.trim()
+                  : supabaseStatusInfo?.configured
                   ? 'bg-amber-950/30 border-amber-500/40 text-amber-300'
                   : 'bg-slate-950/70 border-slate-800 text-slate-300'
               }`}>
                 <div className="flex items-center gap-3">
                   {supabaseStatusInfo?.connected ? (
                     <CheckCircle2 className="h-5 w-5 text-emerald-400 shrink-0" />
-                  ) : supabaseUrlInput.trim() ? (
+                  ) : supabaseStatusInfo?.configured ? (
                     <AlertTriangle className="h-5 w-5 text-amber-400 shrink-0" />
                   ) : (
                     <Zap className="h-5 w-5 text-amber-400 shrink-0" />
@@ -542,16 +475,12 @@ export const SheetsViewer: React.FC<SheetsViewerProps> = ({
                     <div className="font-bold text-sm text-white">
                       {supabaseStatusInfo?.connected 
                         ? 'Status: Terhubung ke Cloud Supabase' 
-                        : supabaseUrlInput.trim()
-                        ? 'Status: Memeriksa Koneksi / Tabel Supabase'
-                        : 'Status: Kunci API Tersedia — Masukkan URL Proyek Supabase'}
+                        : supabaseStatusInfo?.configured
+                        ? 'Status: Memeriksa koneksi Supabase'
+                        : 'Status: Supabase belum dikonfigurasi di Vercel'}
                     </div>
                     <div className="text-[11px] text-slate-400 mt-0.5">
-                      {supabaseStatusInfo?.message || (
-                        supabaseUrlInput.trim() 
-                          ? 'Klik "Simpan & Tes Koneksi" untuk menguji sambungan.' 
-                          : 'Kunci Publishable dan Secret sudah aktif di aplikasi. Lengkapi "URL Proyek Supabase" di bawah.'
-                      )}
+                      {supabaseStatusInfo?.message || 'Periksa environment variables Supabase di pengaturan Vercel.'}
                     </div>
                   </div>
                 </div>
@@ -586,94 +515,24 @@ export const SheetsViewer: React.FC<SheetsViewerProps> = ({
 
             {/* Form Konfigurasi Kunci & URL */}
             <div className="grid md:grid-cols-2 gap-6">
-              {/* Kolom 1: Konfigurasi Endpoint & Kunci */}
-              <form onSubmit={handleSaveSupabaseConfig} className="p-6 rounded-3xl bg-slate-950 border border-slate-800 space-y-4">
-                <div className="border-b border-slate-800 pb-3 flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <KeyRound className="h-4 w-4 text-emerald-400" />
-                    <h4 className="font-bold text-white text-sm">Kredensial Akun Supabase</h4>
-                  </div>
-                  <span className="text-[10px] font-mono text-slate-400 px-2 py-0.5 rounded-md bg-slate-900 border border-slate-800">
-                    Proyek Voxxy
-                  </span>
+              {/* Konfigurasi Supabase dikelola lewat environment variables server-side */}
+              <div className="p-6 rounded-3xl bg-slate-950 border border-slate-800 space-y-4">
+                <div className="flex items-center gap-2 border-b border-slate-800 pb-3">
+                  <Database className="h-4 w-4 text-emerald-400" />
+                  <h4 className="font-bold text-white text-sm">Konfigurasi server aman</h4>
                 </div>
-
-                <div className="space-y-1.5">
-                  <label className="text-slate-300 font-semibold flex items-center justify-between">
-                    <span className="flex items-center gap-1.5">
-                      <Link className="h-3.5 w-3.5 text-emerald-400" /> URL Proyek Supabase (Project URL)
-                    </span>
-                    <a 
-                      href="https://supabase.com/dashboard" 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="text-[10px] text-emerald-400 hover:underline flex items-center gap-1"
-                    >
-                      Buka Supabase <ExternalLink className="h-2.5 w-2.5" />
-                    </a>
-                  </label>
-                  <input
-                    type="url"
-                    placeholder="https://xxxxxxxxxxxxxxxx.supabase.co"
-                    value={supabaseUrlInput}
-                    onChange={e => setSupabaseUrlInput(e.target.value)}
-                    className="w-full bg-slate-900 border border-slate-800 rounded-xl p-2.5 text-white font-mono text-xs focus:outline-none focus:border-emerald-500 placeholder-slate-600"
-                  />
-                  <p className="text-[11px] text-slate-400">
-                    Contoh: <code className="text-emerald-400 font-mono">https://xyzcompany.supabase.co</code> (Dapatkan di Project Settings &gt; API &gt; Project URL).
-                  </p>
-                </div>
-
-                <div className="space-y-1.5">
-                  <label className="text-slate-300 font-semibold flex items-center justify-between">
-                    <span>Publishable Key (Client Anon Key)</span>
-                    <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-mono">Aktif</span>
-                  </label>
-                  <input
-                    type="text"
-                    value={supabasePubKeyInput}
-                    onChange={e => setSupabasePubKeyInput(e.target.value)}
-                    className="w-full bg-slate-900 border border-slate-800 rounded-xl p-2.5 text-slate-200 font-mono text-xs focus:outline-none focus:border-emerald-500"
-                  />
-                  <p className="text-[11px] text-slate-400">
-                    Kunci publik untuk membaca/menulis data aset secara aman.
-                  </p>
-                </div>
-
-                <div className="space-y-1.5">
-                  <label className="text-slate-300 font-semibold flex items-center justify-between">
-                    <span>Secret Key (Service Role Key)</span>
-                    <button
-                      type="button"
-                      onClick={() => setShowSecretKey(!showSecretKey)}
-                      className="text-[11px] text-slate-400 hover:text-white flex items-center gap-1"
-                    >
-                      {showSecretKey ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
-                      <span>{showSecretKey ? 'Sembunyikan' : 'Perlihatkan'}</span>
-                    </button>
-                  </label>
-                  <input
-                    type={showSecretKey ? "text" : "password"}
-                    value={supabaseSecKeyInput}
-                    onChange={e => setSupabaseSecKeyInput(e.target.value)}
-                    className="w-full bg-slate-900 border border-slate-800 rounded-xl p-2.5 text-slate-200 font-mono text-xs focus:outline-none focus:border-emerald-500"
-                  />
-                  <p className="text-[11px] text-slate-400">
-                    Kunci rahasia server untuk sinkronisasi otomatis tanpa blokade RLS.
-                  </p>
-                </div>
-
-                <div className="pt-2 flex justify-end">
-                  <button
-                    type="submit"
-                    disabled={isCheckingSupabase}
-                    className="px-5 py-2.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white rounded-xl font-bold flex items-center gap-2 shadow-lg shadow-emerald-950/40 transition disabled:opacity-50"
-                  >
-                    <Save className="h-4 w-4" />
-                    <span>{isCheckingSupabase ? 'Menghubungkan...' : 'Simpan & Tes Koneksi'}</span>
-                  </button>
-                </div>
-              </form>
+                <p className="text-xs leading-relaxed text-slate-300">
+                  URL Supabase dan service-role key hanya disimpan sebagai environment variables di Vercel. Kunci rahasia tidak dikirim ke browser.
+                </p>
+                <ol className="list-decimal space-y-2 pl-5 text-xs text-slate-400">
+                  <li>Buka Project Settings &gt; Environment Variables di Vercel.</li>
+                  <li>Atur <code className="text-emerald-300">SUPABASE_URL</code> dan <code className="text-emerald-300">SUPABASE_SECRET_KEY</code>.</li>
+                  <li>Pastikan SQL schema di bawah sudah dijalankan di Supabase, lalu redeploy.</li>
+                </ol>
+                <a href="https://vercel.com/dashboard" target="_blank" rel="noreferrer" className="inline-flex items-center gap-1.5 text-xs font-bold text-emerald-400 hover:underline">
+                  Buka Dashboard Vercel <ExternalLink className="h-3 w-3" />
+                </a>
+              </div>
 
               {/* Kolom 2: Sync & Operasi Database */}
               <div className="space-y-4">
@@ -1019,47 +878,18 @@ export const SheetsViewer: React.FC<SheetsViewerProps> = ({
               </div>
             </div>
 
-            {/* Form Pengaturan PIN & Email Admin */}
+            {/* Access is managed centrally in the hosting environment. */}
             <form onSubmit={handleSaveSettings} className="p-6 rounded-3xl bg-slate-950 border border-slate-800 space-y-4">
               <div className="flex items-center justify-between border-b border-slate-800 pb-3">
                 <div className="flex items-center gap-2">
                   <KeyRound className="h-4 w-4 text-orange-400" />
-                  <h4 className="font-bold text-white text-sm">Otorisasi PIN & Whitelist Email Admin</h4>
+                  <h4 className="font-bold text-white text-sm">Akses Admin</h4>
                 </div>
               </div>
 
-              <div className="grid md:grid-cols-2 gap-4">
-                <div className="space-y-1.5">
-                  <label className="text-slate-300 font-semibold flex items-center gap-1.5">
-                    <KeyRound className="h-3.5 w-3.5 text-orange-400" /> PIN Akses Cepat (6 Digit)
-                  </label>
-                  <input
-                    type="text"
-                    maxLength={6}
-                    value={pinInput}
-                    onChange={e => setPinInput(e.target.value)}
-                    className="w-full bg-slate-900 border border-slate-800 rounded-xl p-2.5 text-white font-mono font-bold focus:outline-none focus:border-orange-500 text-sm"
-                  />
-                  <p className="text-[11px] text-slate-400">
-                    PIN otorisasi serah terima laptop atau perubahan data di HP.
-                  </p>
-                </div>
-
-                <div className="space-y-1.5">
-                  <label className="text-slate-300 font-semibold flex items-center gap-1.5">
-                    <Mail className="h-3.5 w-3.5 text-orange-400" /> Email Admin Pengelola (Pisahkan koma)
-                  </label>
-                  <input
-                    type="text"
-                    value={emailsInput}
-                    onChange={e => setEmailsInput(e.target.value)}
-                    className="w-full bg-slate-900 border border-slate-800 rounded-xl p-2.5 text-white text-xs font-mono focus:outline-none focus:border-orange-500"
-                  />
-                  <p className="text-[11px] text-slate-400">
-                    Akun yang memiliki wewenang administrator.
-                  </p>
-                </div>
-              </div>
+              <p className="text-xs leading-relaxed text-slate-300">
+                Login memakai Google Sign-In. Daftar akun yang diizinkan dikontrol di Vercel melalui environment variable <code className="text-orange-300">ADMIN_EMAILS</code> dan tidak dapat diubah dari browser.
+              </p>
 
               <div className="flex justify-end pt-2">
                 <button

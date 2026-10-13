@@ -12,10 +12,10 @@ import {
   pushHandoverToSupabase, 
   pushLogToSupabase, 
   syncAllToSupabase, 
-  SUPABASE_SCHEMA_SQL,
-  DEFAULT_SUPABASE_PUB_KEY,
-  DEFAULT_SUPABASE_SEC_KEY
+  clearSupabaseData
 } from './src/utils/supabaseSync';
+import { SUPABASE_SCHEMA_SQL } from './src/utils/supabaseSchema';
+import { requireAuth, AuthRequest } from './src/middleware/auth';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -40,13 +40,11 @@ function getSeedData() {
     config: {
       companyName: 'Voxxy Media Indonesia',
       prefix: 'VMI',
-      adminPin: process.env.ADMIN_PIN || '',
+      adminPin: '',
       adminEmails: (process.env.ADMIN_EMAILS || '').split(',').map(email => email.trim()).filter(Boolean),
       googleSheetsUrl: '',
       logoUrl: '',
-      supabaseUrl: process.env.SUPABASE_URL || '',
-      supabasePublishableKey: process.env.SUPABASE_PUBLISHABLE_KEY || DEFAULT_SUPABASE_PUB_KEY,
-      supabaseSecretKey: process.env.SUPABASE_SECRET_KEY || DEFAULT_SUPABASE_SEC_KEY
+      supabaseUrl: process.env.SUPABASE_URL || ''
     },
     assets: [],
     handovers: [],
@@ -56,6 +54,10 @@ function getSeedData() {
 
 // Helper untuk membaca database JSON dengan proteksi ganda (primary + backup)
 function readDb() {
+  if (process.env.VERCEL) {
+    return getSeedData();
+  }
+
   // 1. Coba baca dari DB_FILE utama
   try {
     if (fs.existsSync(DB_FILE)) {
@@ -101,6 +103,8 @@ function readDb() {
 
 // Helper untuk menulis database JSON secara ATOMIK (anti-corrupt dan anti-loss)
 function writeDb(data: any) {
+  if (process.env.VERCEL) return true;
+
   try {
     const dir = path.dirname(DB_FILE);
     fs.mkdirSync(dir, { recursive: true });
@@ -125,12 +129,82 @@ function writeDb(data: any) {
   }
 }
 
+function getRequestDb(res: express.Response) {
+  return res.locals.db || readDb();
+}
+
+function getClientDb(db: any) {
+  const config = { ...getSeedData().config, ...db.config, adminPin: '', adminEmails: [] };
+  delete config.supabaseSecretKey;
+  delete config.supabasePublishableKey;
+  return { ...db, config };
+}
+
+function getAdminEmail(res: express.Response) {
+  return res.locals.authUser?.email || 'admin';
+}
+
+async function replaceSupabaseData(supabase: NonNullable<ReturnType<typeof getSupabaseClient>>, db: any) {
+  const clearErrors = await clearSupabaseData(supabase);
+  if (clearErrors.length > 0) return clearErrors;
+  const results = await syncAllToSupabase(supabase, db);
+  return results.errors;
+}
+
 // ================= API ENDPOINTS =================
 
+app.use('/api', (req: AuthRequest, res, next) => {
+  if (!process.env.VERCEL && process.env.NODE_ENV !== 'production') {
+    res.locals.authUser = { email: 'local-admin@example.invalid' };
+    next();
+    return;
+  }
+  requireAuth(req, res, next);
+}, (req: AuthRequest, res, next) => {
+  if (req.user) res.locals.authUser = req.user;
+  next();
+});
+
+app.use('/api', async (_req, res, next) => {
+  if (!process.env.VERCEL) {
+    res.locals.db = readDb();
+    next();
+    return;
+  }
+
+  const supabase = getSupabaseClient();
+  if (!supabase) {
+    res.status(503).json({ success: false, message: 'Supabase server environment variables are not configured.' });
+    return;
+  }
+
+  try {
+    const data = await fetchSupabaseData(supabase);
+    if (!data.success) {
+      res.status(503).json({ success: false, message: data.error || 'Unable to load application data.' });
+      return;
+    }
+
+    res.locals.db = {
+      ...getSeedData(),
+      assets: data.assets || [],
+      handovers: data.handovers || [],
+      logs: data.logs || []
+    };
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/auth', (req: AuthRequest, res) => {
+  res.json({ success: true, email: req.user?.email || res.locals.authUser?.email });
+});
+
 // 0. BI-DIRECTIONAL SMART SYNC (Mencegah data hilang saat refresh & multi-device)
-app.post('/api/sync', (req, res) => {
+app.post('/api/sync', async (req, res) => {
   const { assets = [], handovers = [], logs = [], config } = req.body;
-  const db = readDb();
+  const db = getRequestDb(res);
 
   // Merge Assets secara aman berdasarkan kode_aset unik
   const mergedAssetsMap = new Map<string, any>();
@@ -193,26 +267,34 @@ app.post('/api/sync', (req, res) => {
   db.logs = Array.from(mergedLogsMap.values());
 
   if (config && typeof config === 'object') {
-    db.config = { ...db.config, ...config };
+    const safeConfig = { ...config };
+    delete safeConfig.adminPin;
+    delete safeConfig.adminEmails;
+    delete safeConfig.supabaseUrl;
+    delete safeConfig.supabaseSecretKey;
+    delete safeConfig.supabasePublishableKey;
+    db.config = { ...db.config, ...safeConfig };
   }
 
   writeDb(db);
 
-  // Sync batch ke Supabase jika terhubung
-  const supabase = getSupabaseClient(db.config);
+  const supabase = getSupabaseClient();
   if (supabase) {
-    syncAllToSupabase(supabase, db).catch(err => console.warn('Supabase syncAll warning:', err));
+    const results = await syncAllToSupabase(supabase, db);
+    if (results.errors.length > 0) {
+      return res.status(502).json({ success: false, message: results.errors.join('; ') });
+    }
   }
 
-  res.json({ success: true, message: 'Sinkronisasi berhasil', data: db });
+  res.json({ success: true, message: 'Sinkronisasi berhasil', data: getClientDb(db) });
 });
 
 // 1. GET ALL DATA (Sinkron dengan Supabase jika URL sudah disetel)
 app.get('/api/data', async (_req, res) => {
-  const db = readDb();
+  const db = getRequestDb(res);
 
   // Jika Supabase terkonfigurasi, coba sinkronkan data dari Supabase
-  const supabase = getSupabaseClient(db.config);
+  const supabase = getSupabaseClient();
   if (supabase) {
     try {
       const supaData = await fetchSupabaseData(supabase);
@@ -243,19 +325,19 @@ app.get('/api/data', async (_req, res) => {
     }
   }
 
-  res.json({ success: true, timestamp: Date.now(), data: db });
+  res.json({ success: true, timestamp: Date.now(), data: getClientDb(db) });
 });
 
 // 2. GET ASSETS
 app.get('/api/assets', (_req, res) => {
-  const db = readDb();
+  const db = getRequestDb(res);
   res.json({ success: true, assets: db.assets || [] });
 });
 
 // 3. GET ASSET BY CODE
 app.get('/api/assets/:code', (req, res) => {
   const code = req.params.code.toUpperCase();
-  const db = readDb();
+  const db = getRequestDb(res);
   const asset = (db.assets || []).find((a: any) => a.kode_aset.toUpperCase() === code);
   if (!asset) {
     return res.status(404).json({ success: false, message: 'Aset tidak ditemukan' });
@@ -263,23 +345,10 @@ app.get('/api/assets/:code', (req, res) => {
   res.json({ success: true, asset });
 });
 
-// Helper validasi PIN
-function verifyPin(pin: any, dbConfig: any): boolean {
-  const configuredPin = dbConfig?.adminPin ? String(dbConfig.adminPin).trim() : '';
-  if (!pin || !configuredPin) return false;
-  const inputPin = String(pin).trim();
-  return inputPin === configuredPin;
-}
-
 // 4. POST CREATE / REGISTER ASSET
-app.post('/api/assets', (req, res) => {
-  const { asset, pin, operatorEmail } = req.body;
-  const db = readDb();
-
-  if (!verifyPin(pin, db.config)) {
-    return res.status(403).json({ success: false, message: 'PIN Admin salah!' });
-  }
-
+app.post('/api/assets', async (req, res) => {
+  const { asset } = req.body;
+  const db = getRequestDb(res);
   const existingIndex = (db.assets || []).findIndex(
     (a: any) => a.kode_aset.toUpperCase() === asset.kode_aset.toUpperCase()
   );
@@ -294,7 +363,7 @@ app.post('/api/assets', (req, res) => {
     db.logs.unshift({
       id: `LOG-${Date.now().toString().slice(-4)}`,
       timestamp: now,
-      user_admin: operatorEmail || 'admin',
+      user_admin: getAdminEmail(res),
       aksi: 'UPDATE_DATA',
       kode_aset: asset.kode_aset,
       deskripsi: `Update data aset ${asset.merk} ${asset.tipe_model}`
@@ -306,7 +375,7 @@ app.post('/api/assets', (req, res) => {
     db.logs.unshift({
       id: `LOG-${Date.now().toString().slice(-4)}`,
       timestamp: now,
-      user_admin: operatorEmail || 'admin',
+      user_admin: getAdminEmail(res),
       aksi: 'REGISTRASI_BARU',
       kode_aset: asset.kode_aset,
       deskripsi: `Registrasi baru laptop ${asset.merk} ${asset.tipe_model} (SN: ${asset.nomor_seri})`
@@ -316,24 +385,22 @@ app.post('/api/assets', (req, res) => {
   writeDb(db);
 
   // Sync real-time ke Supabase jika terhubung
-  const supabase = getSupabaseClient(db.config);
+  const supabase = getSupabaseClient();
   if (supabase && savedAsset) {
-    pushAssetToSupabase(supabase, savedAsset).catch(err => console.warn('Supabase asset push error:', err));
-    if (db.logs[0]) pushLogToSupabase(supabase, db.logs[0]).catch(() => {});
+    const assetSaved = await pushAssetToSupabase(supabase, savedAsset);
+    const logSaved = !db.logs[0] || await pushLogToSupabase(supabase, db.logs[0]);
+    if (!assetSaved || !logSaved) {
+      return res.status(502).json({ success: false, message: 'Gagal menyimpan perubahan ke Supabase.' });
+    }
   }
 
   res.json({ success: true, message: 'Data berhasil disimpan', asset: savedAsset });
 });
 
 // 5. POST HANDOVER
-app.post('/api/handovers', (req, res) => {
-  const { handover, pin, operatorEmail } = req.body;
-  const db = readDb();
-
-  if (!verifyPin(pin, db.config)) {
-    return res.status(403).json({ success: false, message: 'PIN Admin salah!' });
-  }
-
+app.post('/api/handovers', async (req, res) => {
+  const { handover } = req.body;
+  const db = getRequestDb(res);
   // Update Asset status
   const targetAsset = (db.assets || []).find(
     (a: any) => a.kode_aset.toUpperCase() === handover.kode_aset.toUpperCase()
@@ -353,7 +420,7 @@ app.post('/api/handovers', (req, res) => {
   db.logs.unshift({
     id: `LOG-${Date.now().toString().slice(-4)}`,
     timestamp: handover.created_at,
-    user_admin: operatorEmail || 'admin',
+    user_admin: getAdminEmail(res),
     aksi: 'HANDOVER',
     kode_aset: handover.kode_aset,
     deskripsi: `Serah terima ke ${handover.nama_penerima} (${handover.departemen}). Surat: ${handover.no_surat}`
@@ -362,26 +429,24 @@ app.post('/api/handovers', (req, res) => {
   writeDb(db);
 
   // Sync real-time ke Supabase jika terhubung
-  const supabase = getSupabaseClient(db.config);
+  const supabase = getSupabaseClient();
   if (supabase) {
-    pushHandoverToSupabase(supabase, handover).catch(err => console.warn('Supabase handover push error:', err));
-    if (targetAsset) pushAssetToSupabase(supabase, targetAsset).catch(() => {});
-    if (db.logs[0]) pushLogToSupabase(supabase, db.logs[0]).catch(() => {});
+    const handoverSaved = await pushHandoverToSupabase(supabase, handover);
+    const assetSaved = !targetAsset || await pushAssetToSupabase(supabase, targetAsset);
+    const logSaved = !db.logs[0] || await pushLogToSupabase(supabase, db.logs[0]);
+    if (!handoverSaved || !assetSaved || !logSaved) {
+      return res.status(502).json({ success: false, message: 'Gagal menyimpan serah terima ke Supabase.' });
+    }
   }
 
   res.json({ success: true, message: 'Serah terima berhasil dicatat', handover });
 });
 
 // 6. POST RETURN ASSET
-app.post('/api/assets/:code/return', (req, res) => {
+app.post('/api/assets/:code/return', async (req, res) => {
   const code = req.params.code.toUpperCase();
-  const { pin, operatorEmail } = req.body;
-  const db = readDb();
 
-  if (!verifyPin(pin, db.config)) {
-    return res.status(403).json({ success: false, message: 'PIN Admin salah!' });
-  }
-
+  const db = getRequestDb(res);
   const targetAsset = (db.assets || []).find((a: any) => a.kode_aset.toUpperCase() === code);
   if (!targetAsset) {
     return res.status(404).json({ success: false, message: 'Aset tidak ditemukan' });
@@ -398,7 +463,7 @@ app.post('/api/assets/:code/return', (req, res) => {
   db.logs.unshift({
     id: `LOG-${Date.now().toString().slice(-4)}`,
     timestamp: now,
-    user_admin: operatorEmail || 'admin',
+    user_admin: getAdminEmail(res),
     aksi: 'RETURN',
     kode_aset: targetAsset.kode_aset,
     deskripsi: `Pengembalian laptop dari ${previousHolder}. Status kembali Tersedia di gudang.`
@@ -407,25 +472,23 @@ app.post('/api/assets/:code/return', (req, res) => {
   writeDb(db);
 
   // Sync real-time ke Supabase jika terhubung
-  const supabase = getSupabaseClient(db.config);
+  const supabase = getSupabaseClient();
   if (supabase) {
-    pushAssetToSupabase(supabase, targetAsset).catch(() => {});
-    if (db.logs[0]) pushLogToSupabase(supabase, db.logs[0]).catch(() => {});
+    const assetSaved = await pushAssetToSupabase(supabase, targetAsset);
+    const logSaved = !db.logs[0] || await pushLogToSupabase(supabase, db.logs[0]);
+    if (!assetSaved || !logSaved) {
+      return res.status(502).json({ success: false, message: 'Gagal menyimpan pengembalian ke Supabase.' });
+    }
   }
 
   res.json({ success: true, message: 'Unit berhasil dikembalikan ke status Tersedia', asset: targetAsset });
 });
 
 // 7. DELETE ASSET
-app.delete('/api/assets/:code', (req, res) => {
+app.delete('/api/assets/:code', async (req, res) => {
   const code = req.params.code.toUpperCase();
-  const { pin, operatorEmail } = req.body;
-  const db = readDb();
 
-  if (!verifyPin(pin, db.config)) {
-    return res.status(403).json({ success: false, message: 'PIN Admin salah!' });
-  }
-
+  const db = getRequestDb(res);
   const assetIndex = (db.assets || []).findIndex((a: any) => a.kode_aset.toUpperCase() === code);
   if (assetIndex === -1) {
     return res.status(404).json({ success: false, message: 'Aset tidak ditemukan' });
@@ -438,7 +501,7 @@ app.delete('/api/assets/:code', (req, res) => {
   db.logs.unshift({
     id: `LOG-${Date.now().toString().slice(-4)}`,
     timestamp: now,
-    user_admin: operatorEmail || 'admin',
+    user_admin: getAdminEmail(res),
     aksi: 'HAPUS_ASET',
     kode_aset: code,
     deskripsi: `Penghapusan unit ${deletedAsset.merk} ${deletedAsset.tipe_model} (SN: ${deletedAsset.nomor_seri}) dari database.`
@@ -447,10 +510,13 @@ app.delete('/api/assets/:code', (req, res) => {
   writeDb(db);
 
   // Sync real-time ke Supabase jika terhubung
-  const supabase = getSupabaseClient(db.config);
+  const supabase = getSupabaseClient();
   if (supabase) {
-    deleteAssetFromSupabase(supabase, code).catch(() => {});
-    if (db.logs[0]) pushLogToSupabase(supabase, db.logs[0]).catch(() => {});
+    const assetDeleted = await deleteAssetFromSupabase(supabase, code);
+    const logSaved = !db.logs[0] || await pushLogToSupabase(supabase, db.logs[0]);
+    if (!assetDeleted || !logSaved) {
+      return res.status(502).json({ success: false, message: 'Gagal menghapus aset dari Supabase.' });
+    }
   }
 
   res.json({ success: true, message: `Unit ${code} berhasil dihapus dari database` });
@@ -460,17 +526,12 @@ app.delete('/api/assets/:code', (req, res) => {
 
 // Cek status koneksi Supabase & Skrip SQL
 app.get('/api/supabase/status', async (_req, res) => {
-  const db = readDb();
-  const client = getSupabaseClient(db.config);
-  
+  const client = getSupabaseClient();
   if (!client) {
     return res.json({
       configured: false,
       connected: false,
-      url: db.config?.supabaseUrl || process.env.SUPABASE_URL || '',
-      publishableKey: db.config?.supabasePublishableKey || process.env.SUPABASE_PUBLISHABLE_KEY || DEFAULT_SUPABASE_PUB_KEY,
-      secretKey: db.config?.supabaseSecretKey || process.env.SUPABASE_SECRET_KEY || DEFAULT_SUPABASE_SEC_KEY,
-      message: 'Supabase Project URL belum disetel. Masukkan URL proyek Supabase Anda (contoh: https://xyz.supabase.co).',
+      message: 'Atur SUPABASE_URL dan SUPABASE_SECRET_KEY di environment variables server.',
       schemaSql: SUPABASE_SCHEMA_SQL
     });
   }
@@ -480,85 +541,33 @@ app.get('/api/supabase/status', async (_req, res) => {
     configured: true,
     connected: health.connected,
     tables: health.tables,
-    url: db.config?.supabaseUrl || process.env.SUPABASE_URL || '',
-    publishableKey: db.config?.supabasePublishableKey || process.env.SUPABASE_PUBLISHABLE_KEY || DEFAULT_SUPABASE_PUB_KEY,
-    secretKey: db.config?.supabaseSecretKey || process.env.SUPABASE_SECRET_KEY || DEFAULT_SUPABASE_SEC_KEY,
     message: health.message,
     schemaSql: SUPABASE_SCHEMA_SQL
   });
 });
 
-// Test koneksi & simpan konfigurasi Supabase
-app.post('/api/supabase/config', async (req, res) => {
-  const { supabaseUrl, supabasePublishableKey, supabaseSecretKey, pin } = req.body;
-  const db = readDb();
-
-  if (!verifyPin(pin, db.config)) {
-    return res.status(403).json({ success: false, message: 'PIN Admin salah!' });
-  }
-
-  db.config = {
-    ...db.config,
-    supabaseUrl: (supabaseUrl || '').trim(),
-    supabasePublishableKey: (supabasePublishableKey || DEFAULT_SUPABASE_PUB_KEY).trim(),
-    supabaseSecretKey: (supabaseSecretKey || DEFAULT_SUPABASE_SEC_KEY).trim()
-  };
-  writeDb(db);
-
-  const client = getSupabaseClient(db.config);
-  if (!client) {
-    return res.json({
-      success: true,
-      connected: false,
-      message: 'Konfigurasi disimpan, namun URL Supabase belum diisi atau formatnya tidak valid.',
-      config: db.config
-    });
-  }
-
-  const health = await checkSupabaseHealth(client);
-  res.json({
-    success: true,
-    connected: health.connected,
-    tables: health.tables,
-    message: health.message,
-    config: db.config
-  });
-});
-
 // Push semua data lokal saat ini ke Supabase
 app.post('/api/supabase/push-all', async (req, res) => {
-  const { pin } = req.body;
-  const db = readDb();
-
-  if (!verifyPin(pin, db.config)) {
-    return res.status(403).json({ success: false, message: 'PIN Admin salah!' });
-  }
-
-  const client = getSupabaseClient(db.config);
+  const db = getRequestDb(res);
+  const client = getSupabaseClient();
   if (!client) {
     return res.status(400).json({ success: false, message: 'Supabase Project URL belum diisi!' });
   }
 
   const results = await syncAllToSupabase(client, db);
-  res.json({
+  res.status(results.errors.length === 0 ? 200 : 502).json({
     success: results.errors.length === 0,
-    message: results.errors.length === 0 
+    message: results.errors.length === 0
       ? `Berhasil mengunggah ${results.assetsPushed} aset dan ${results.handoversPushed} BAST ke Supabase!`
-      : `Unggah selesai dengan catatan: ${results.errors.join(', ')}`,
+      : `Unggah gagal: ${results.errors.join(', ')}`,
     results
   });
 });
 
 // Tarik semua data dari Supabase ke database lokal
 app.post('/api/supabase/pull-all', async (req, res) => {
-  const { pin } = req.body;
-  const db = readDb();
-
-  if (!verifyPin(pin, db.config)) {
-    return res.status(403).json({ success: false, message: 'PIN Admin salah!' });
-  }
-
-  const client = getSupabaseClient(db.config);
+  const db = getRequestDb(res);
+  const client = getSupabaseClient();
   if (!client) {
     return res.status(400).json({ success: false, message: 'Supabase belum terkonfigurasi!' });
   }
@@ -576,47 +585,42 @@ app.post('/api/supabase/pull-all', async (req, res) => {
   res.json({
     success: true,
     message: `Berhasil mengunduh ${db.assets.length} aset dari Supabase ke database lokal!`,
-    data: db
+    data: getClientDb(db)
   });
 });
 
 // 8. CONFIG & GOOGLE SHEETS SYNC URL
 app.post('/api/config', (req, res) => {
-  const { config, pin } = req.body;
-  const db = readDb();
-
-  if (!verifyPin(pin, db.config)) {
-    return res.status(403).json({ success: false, message: 'PIN Admin salah!' });
-  }
-
-  db.config = { ...db.config, ...config };
+  const { config } = req.body;
+  const db = getRequestDb(res);
+  const safeConfig = { ...config };
+  delete safeConfig.adminPin;
+  delete safeConfig.adminEmails;
+  delete safeConfig.supabaseUrl;
+  delete safeConfig.supabaseSecretKey;
+  delete safeConfig.supabasePublishableKey;
+  db.config = { ...db.config, ...safeConfig };
   writeDb(db);
-  res.json({ success: true, message: 'Pengaturan berhasil diperbarui', config: db.config });
+  res.json({ success: true, message: 'Pengaturan berhasil diperbarui', config: getClientDb(db).config });
 });
 
 // 9. RESET DEMO DATA (Memuat ulang 8 barang kantor standar)
-app.post('/api/reset-demo', (req, res) => {
-  const { pin } = req.body;
-  const db = readDb();
-
-  if (!verifyPin(pin, db.config)) {
-    return res.status(403).json({ success: false, message: 'PIN Admin salah!' });
-  }
-
+app.post('/api/reset-demo', async (_req, res) => {
   const seeded = getSeedData();
+  const client = getSupabaseClient();
+  if (process.env.VERCEL && client) {
+    const errors = await replaceSupabaseData(client, seeded);
+    if (errors.length > 0) {
+      return res.status(502).json({ success: false, message: `Gagal reset Supabase: ${errors.join('; ')}` });
+    }
+  }
   writeDb(seeded);
-  res.json({ success: true, message: 'Data demo kantor berhasil dimuat ulang!', data: seeded });
+  res.json({ success: true, message: 'Data demo kantor berhasil dimuat ulang!', data: getClientDb(seeded) });
 });
 
 // 9b. KOSONGKAN SELURUH DATABASE INVENTARIS
-app.post('/api/clear-all', (req, res) => {
-  const { pin } = req.body;
-  const db = readDb();
-
-  if (!verifyPin(pin, db.config)) {
-    return res.status(403).json({ success: false, message: 'PIN Admin salah!' });
-  }
-
+app.post('/api/clear-all', async (_req, res) => {
+  const db = getRequestDb(res);
   const emptyData = {
     config: db.config,
     assets: [],
@@ -633,33 +637,42 @@ app.post('/api/clear-all', (req, res) => {
     ],
     initialized: true
   };
+  const client = getSupabaseClient();
+  if (process.env.VERCEL && client) {
+    const errors = await replaceSupabaseData(client, emptyData);
+    if (errors.length > 0) {
+      return res.status(502).json({ success: false, message: `Gagal mengosongkan Supabase: ${errors.join('; ')}` });
+    }
+  }
   writeDb(emptyData);
-  res.json({ success: true, message: 'Seluruh data inventaris berhasil dikosongkan!', data: emptyData });
+  res.json({ success: true, message: 'Seluruh data inventaris berhasil dikosongkan!', data: getClientDb(emptyData) });
 });
 
 // 10. RESTORE BACKUP DATA
-app.post('/api/restore-backup', (req, res) => {
-  const { data, pin } = req.body;
-  const db = readDb();
-
-  if (!verifyPin(pin, db.config)) {
-    return res.status(403).json({ success: false, message: 'PIN Admin salah!' });
-  }
-
+app.post('/api/restore-backup', async (req, res) => {
+  const db = getRequestDb(res);
+  const { data } = req.body;
   if (!data || typeof data !== 'object') {
     return res.status(400).json({ success: false, message: 'Format data backup tidak valid!' });
   }
 
   const restored = {
-    config: data.config ? { ...db.config, ...data.config } : db.config,
+    config: db.config,
     assets: Array.isArray(data.assets) ? data.assets : db.assets,
     handovers: Array.isArray(data.handovers) ? data.handovers : db.handovers,
     logs: Array.isArray(data.logs) ? data.logs : db.logs,
     initialized: true
   };
 
+  const client = getSupabaseClient();
+  if (process.env.VERCEL && client) {
+    const errors = await replaceSupabaseData(client, restored);
+    if (errors.length > 0) {
+      return res.status(502).json({ success: false, message: `Gagal restore ke Supabase: ${errors.join('; ')}` });
+    }
+  }
   writeDb(restored);
-  res.json({ success: true, message: 'Data berhasil di-restore!', data: restored });
+  res.json({ success: true, message: 'Data berhasil di-restore!', data: getClientDb(restored) });
 });
 
 // Mount Vite in Dev mode or static files in Production
@@ -683,4 +696,11 @@ async function startServer() {
   });
 }
 
-startServer();
+export default app;
+
+if (!process.env.VERCEL) {
+  startServer().catch(error => {
+    console.error('Failed to start inventory server:', error);
+    process.exitCode = 1;
+  });
+}

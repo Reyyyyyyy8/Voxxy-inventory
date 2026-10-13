@@ -70,8 +70,6 @@ export interface SystemConfig {
   googleSheetsUrl?: string;
   logoUrl?: string;
   supabaseUrl?: string;
-  supabasePublishableKey?: string;
-  supabaseSecretKey?: string;
 }
 
 export interface CategoryItem {

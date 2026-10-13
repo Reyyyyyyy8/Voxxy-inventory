@@ -1,104 +1,31 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
-export const DEFAULT_SUPABASE_PUB_KEY = '';
-export const DEFAULT_SUPABASE_SEC_KEY = '';
+export function getSupabaseClient(): SupabaseClient | null {
+  const url = (process.env.SUPABASE_URL || '').trim();
+  const key = (process.env.SUPABASE_SECRET_KEY || '').trim();
 
-export const SUPABASE_SCHEMA_SQL = `-- SKRIP SQL INISIALISASI DATABASE VOXXY DI SUPABASE
--- Salin seluruh teks ini dan tempel di Supabase Dashboard -> SQL Editor -> Klik "Run"
-
--- 1. TABEL INVENTARIS ASET
-CREATE TABLE IF NOT EXISTS assets (
-  kode_aset TEXT PRIMARY KEY,
-  kategori TEXT NOT NULL,
-  merk TEXT NOT NULL,
-  tipe_model TEXT NOT NULL,
-  nomor_seri TEXT,
-  spesifikasi TEXT,
-  tgl_beli TEXT,
-  harga BIGINT DEFAULT 0,
-  vendor TEXT,
-  kondisi TEXT,
-  status TEXT DEFAULT 'Tersedia',
-  lokasi TEXT,
-  user_saat_ini TEXT,
-  departemen_user TEXT,
-  catatan TEXT,
-  created_at TEXT,
-  updated_at TEXT
-);
-
--- 2. TABEL SERAH TERIMA & BAST (HANDOVER)
-CREATE TABLE IF NOT EXISTS handovers (
-  id_handover TEXT PRIMARY KEY,
-  no_surat TEXT,
-  kode_aset TEXT REFERENCES assets(kode_aset) ON DELETE SET NULL,
-  jenis_transaksi TEXT,
-  tgl_handover TEXT,
-  nama_penerima TEXT,
-  email_penerima TEXT,
-  nik_karyawan TEXT,
-  departemen TEXT,
-  jabatan TEXT,
-  nama_petugas TEXT,
-  email_petugas TEXT,
-  kondisi_fisik TEXT,
-  kelengkapan JSONB DEFAULT '[]'::jsonb,
-  catatan_kelengkapan TEXT,
-  ttd_penerima TEXT,
-  ttd_petugas TEXT,
-  pdf_drive_link TEXT,
-  created_at TEXT
-);
-
--- 3. TABEL LOG AKTIVITAS (AUDIT TRAIL)
-CREATE TABLE IF NOT EXISTS logs (
-  id TEXT PRIMARY KEY,
-  timestamp TEXT,
-  user_admin TEXT,
-  aksi TEXT,
-  kode_aset TEXT,
-  deskripsi TEXT
-);
-
--- 4. KEAMANAN RLS (Row Level Security)
-ALTER TABLE assets ENABLE ROW LEVEL SECURITY;
-ALTER TABLE handovers ENABLE ROW LEVEL SECURITY;
-ALTER TABLE logs ENABLE ROW LEVEL SECURITY;
-
--- Buat Policy agar aplikasi backend/frontend dapat membaca dan menulis data
-DROP POLICY IF EXISTS "Public Full Access Assets" ON assets;
-CREATE POLICY "Public Full Access Assets" ON assets FOR ALL USING (true) WITH CHECK (true);
-
-DROP POLICY IF EXISTS "Public Full Access Handovers" ON handovers;
-CREATE POLICY "Public Full Access Handovers" ON handovers FOR ALL USING (true) WITH CHECK (true);
-
-DROP POLICY IF EXISTS "Public Full Access Logs" ON logs;
-CREATE POLICY "Public Full Access Logs" ON logs FOR ALL USING (true) WITH CHECK (true);
-`;
-
-export function getSupabaseClient(config?: { supabaseUrl?: string; supabaseSecretKey?: string; supabasePublishableKey?: string }): SupabaseClient | null {
-  const url = (process.env.SUPABASE_URL || config?.supabaseUrl || '').trim();
-  const key = (
-    process.env.SUPABASE_SECRET_KEY || 
-    config?.supabaseSecretKey || 
-    DEFAULT_SUPABASE_SEC_KEY || 
-    process.env.SUPABASE_PUBLISHABLE_KEY || 
-    config?.supabasePublishableKey || 
-    DEFAULT_SUPABASE_PUB_KEY
-  ).trim();
-
-  if (!url || !url.startsWith('http')) {
+  if (!url || !url.startsWith('https://') || !key) {
     return null;
   }
 
-  try {
-    return createClient(url, key, {
-      auth: { persistSession: false }
-    });
-  } catch (err) {
-    console.warn('Gagal inisialisasi Supabase client:', err);
-    return null;
-  }
+  return createClient(url, key, {
+    auth: { persistSession: false }
+  });
+}
+
+export async function clearSupabaseData(supabase: SupabaseClient): Promise<string[]> {
+  const errors: string[] = [];
+  const handovers = await supabase.from('handovers').delete().neq('id_handover', '');
+  if (handovers.error) errors.push(`Handovers: ${handovers.error.message}`);
+
+  const logs = await supabase.from('logs').delete().neq('id', '');
+  if (logs.error) errors.push(`Logs: ${logs.error.message}`);
+
+  if (errors.length > 0) return errors;
+
+  const assets = await supabase.from('assets').delete().neq('kode_aset', '');
+  if (assets.error) errors.push(`Assets: ${assets.error.message}`);
+  return errors;
 }
 
 /**

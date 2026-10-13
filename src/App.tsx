@@ -9,11 +9,13 @@ import { BastPdfPreview } from './components/BastPdfPreview';
 import { QrBatchGenerator } from './components/QrBatchGenerator';
 import { SheetsViewer } from './components/SheetsViewer';
 import { TutorialGuide } from './components/TutorialGuide';
-import { PinModal } from './components/PinModal';
 import { DeleteModal } from './components/DeleteModal';
 import { FullInventoryView } from './components/FullInventoryView';
 import { MobileConnectModal } from './components/MobileConnectModal';
 import { generateNextAssetCode } from './utils/qrGenerator';
+import { auth, googleAuthProvider } from './lib/firebase';
+import { onAuthStateChanged, signInWithPopup, signOut, User } from 'firebase/auth';
+import { apiFetch } from './utils/api';
 import { 
   Laptop, 
   QrCode, 
@@ -34,6 +36,80 @@ import {
 } from 'lucide-react';
 
 export default function App() {
+  const [user, setUser] = useState<User | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [authorized, setAuthorized] = useState(false);
+  const [authError, setAuthError] = useState('');
+
+  useEffect(() => onAuthStateChanged(auth, async currentUser => {
+    setUser(currentUser);
+    setAuthorized(false);
+    setAuthError('');
+    if (!currentUser) {
+      setAuthReady(true);
+      return;
+    }
+
+    try {
+      const response = await apiFetch('/api/auth');
+      if (!response.ok) {
+        setAuthError(response.status === 403
+          ? 'Akun ini tidak diizinkan mengakses sistem.'
+          : 'Tidak dapat memverifikasi akses admin. Periksa konfigurasi deployment.');
+        setAuthReady(true);
+        return;
+      }
+      setAuthorized(true);
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : 'Gagal memverifikasi akun.');
+    } finally {
+      setAuthReady(true);
+    }
+  }), []);
+
+  const handleGoogleSignIn = async () => {
+    setAuthError('');
+    try {
+      await signInWithPopup(auth, googleAuthProvider);
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : 'Gagal masuk menggunakan Google.');
+    }
+  };
+
+  if (!authReady) {
+    return <div className="min-h-screen bg-slate-950 text-slate-300 grid place-items-center">Memeriksa sesi admin...</div>;
+  }
+
+  if (!user || !authorized) {
+    return (
+      <div className="min-h-screen bg-slate-950 text-slate-100 grid place-items-center p-6">
+        <div className="w-full max-w-md rounded-3xl border border-slate-800 bg-slate-900 p-8 text-center space-y-5">
+          <div className="mx-auto h-14 w-14 rounded-2xl bg-orange-500/15 text-orange-400 grid place-items-center">
+            <Lock className="h-7 w-7" />
+          </div>
+          <div>
+            <h1 className="text-xl font-black">Voxxy Inventory</h1>
+            <p className="mt-2 text-sm text-slate-400">Masuk dengan akun Google admin yang terdaftar.</p>
+          </div>
+          {authError && <p role="alert" className="rounded-xl border border-rose-500/30 bg-rose-950/30 p-3 text-sm text-rose-300">{authError}</p>}
+          {user ? (
+            <button onClick={() => signOut(auth)} className="w-full rounded-xl bg-slate-800 px-4 py-3 font-bold hover:bg-slate-700">
+              Keluar dari {user.email}
+            </button>
+          ) : (
+            <button onClick={handleGoogleSignIn} className="w-full rounded-xl bg-orange-500 px-4 py-3 font-bold text-white hover:bg-orange-400">
+              Masuk dengan Google
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  return <InventoryApp onSignOut={() => signOut(auth)} />;
+}
+
+function InventoryApp({ onSignOut }: { onSignOut: () => void }) {
   // Navigation Tabs: 'scan' | 'inventory' | 'stickers' | 'sheets' | 'guide' (Persistent on Refresh)
   const [activeMainTab, setActiveMainTab] = useState<'scan' | 'inventory' | 'stickers' | 'sheets' | 'guide'>(() => {
     try {
@@ -132,9 +208,7 @@ export default function App() {
       adminEmails: [],
       googleSheetsUrl: '',
       logoUrl: '',
-      supabaseUrl: '',
-      supabasePublishableKey: '',
-      supabaseSecretKey: ''
+      supabaseUrl: ''
     };
   });
 
@@ -191,7 +265,7 @@ export default function App() {
       } catch {}
 
       // Kirim sync dua arah ke backend
-      const res = await fetch('/api/sync', {
+      const res = await apiFetch('/api/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' },
         body: JSON.stringify({
@@ -268,10 +342,10 @@ export default function App() {
     setConfig(newConfig);
     persistLocally(undefined, undefined, undefined, newConfig);
     try {
-      await fetch('/api/config', {
+      await apiFetch('/api/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ config: newConfig, pin: newConfig.adminPin })
+        body: JSON.stringify({ config: newConfig })
       });
       notifyChange();
       showToast('Pengaturan sistem berhasil disimpan!');
@@ -285,10 +359,7 @@ export default function App() {
   const [activeBastHandover, setActiveBastHandover] = useState<HandoverRecord | null>(INITIAL_HANDOVERS[0]);
   const [assetToDelete, setAssetToDelete] = useState<Asset | null>(null);
 
-  // Security & PIN State
-  const [isPinModalOpen, setIsPinModalOpen] = useState(false);
-  const [isPinAuthenticated, setIsPinAuthenticated] = useState(false);
-  const [pendingAction, setPendingAction] = useState<(() => void) | null>(null);
+  const isAdminSession = true;
 
   // Toast feedback
   const [toastMessage, setToastMessage] = useState<string | null>(null);
@@ -298,24 +369,8 @@ export default function App() {
     setTimeout(() => setToastMessage(null), 3500);
   };
 
-  // Guard action with PIN
   const executeWithPinGuard = (action: () => void) => {
-    if (isPinAuthenticated) {
-      action();
-    } else {
-      setPendingAction(() => action);
-      setIsPinModalOpen(true);
-    }
-  };
-
-  const handlePinSuccess = () => {
-    setIsPinAuthenticated(true);
-    setIsPinModalOpen(false);
-    showToast('PIN Terverifikasi! Akses Admin Aktif.');
-    if (pendingAction) {
-      pendingAction();
-      setPendingAction(null);
-    }
+    action();
   };
 
   // Alur Scan QR Code
@@ -365,13 +420,11 @@ export default function App() {
     persistLocally(updated);
 
     try {
-      const res = await fetch('/api/assets', {
+      const res = await apiFetch('/api/assets', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          asset: assetData,
-          pin: config.adminPin || '',
-          operatorEmail: config.adminEmails[0] || 'admin'
+          asset: assetData
         })
       });
       if (res.ok) {
@@ -406,13 +459,11 @@ export default function App() {
     persistLocally(updatedAssets, updatedHandovers);
 
     try {
-      const res = await fetch('/api/handovers', {
+      const res = await apiFetch('/api/handovers', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          handover: handoverRecord,
-          pin: config.adminPin || '',
-          operatorEmail: config.adminEmails[0] || 'admin'
+          handover: handoverRecord
         })
       });
       if (res.ok) {
@@ -450,13 +501,10 @@ export default function App() {
       persistLocally(updatedAssets);
 
       try {
-        const res = await fetch(`/api/assets/${encodeURIComponent(selectedAssetCode)}/return`, {
+        const res = await apiFetch(`/api/assets/${encodeURIComponent(selectedAssetCode)}/return`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            pin: config.adminPin || '',
-            operatorEmail: config.adminEmails[0] || 'admin'
-          })
+          body: JSON.stringify({})
         });
         if (res.ok) {
           notifyChange();
@@ -499,13 +547,10 @@ export default function App() {
     persistLocally(updatedAssets, undefined, updatedLogs);
 
     try {
-      await fetch(`/api/assets/${encodeURIComponent(code)}`, {
+      await apiFetch(`/api/assets/${encodeURIComponent(code)}`, {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          pin: config.adminPin || '',
-          operatorEmail: config.adminEmails[0] || 'admin'
-        })
+        body: JSON.stringify({})
       });
       notifyChange();
     } catch (e) {
@@ -545,14 +590,22 @@ export default function App() {
       persistLocally([], [], newLogs);
 
       try {
-        await fetch('/api/clear-all', {
+        const response = await apiFetch('/api/clear-all', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ pin: config.adminPin || '' })
+          body: JSON.stringify({})
         });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
         notifyChange();
       } catch (e) {
         console.warn('Backend clear notice:', e);
+        setAssets(assets);
+        setHandovers(handovers);
+        setLogs(logs);
+        persistLocally(assets, handovers, logs);
+        showToast('Gagal mengosongkan database cloud. Periksa koneksi, lalu coba lagi.');
+        setIsSyncing(false);
+        return;
       } finally {
         setIsSyncing(false);
       }
@@ -565,11 +618,12 @@ export default function App() {
     executeWithPinGuard(async () => {
       setIsSyncing(true);
       try {
-        const res = await fetch('/api/reset-demo', {
+        const res = await apiFetch('/api/reset-demo', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ pin: config.adminPin || '' })
+          body: JSON.stringify({})
         });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const json = await res.json();
         if (json.success && json.data) {
           if (json.data.config) setConfig(json.data.config);
@@ -581,13 +635,8 @@ export default function App() {
           showToast('Data demo kantor (8 kategori) berhasil dimuat ulang!');
         }
       } catch (e) {
-        // Fallback jika backend tidak tersedia (misal static di Vercel atau offline)
-        setAssets(INITIAL_ASSETS);
-        setHandovers(INITIAL_HANDOVERS);
-        setLogs(INITIAL_LOGS);
-        persistLocally(INITIAL_ASSETS, INITIAL_HANDOVERS, INITIAL_LOGS);
-        notifyChange();
-        showToast('Data kantor (8 kategori) berhasil dimuat ulang!');
+        console.error('Backend reset failed:', e);
+        showToast('Gagal mereset data cloud. Periksa koneksi, lalu coba lagi.');
       } finally {
         setIsSyncing(false);
       }
@@ -602,19 +651,23 @@ export default function App() {
       if (Array.isArray(backupData.logs)) setLogs(backupData.logs);
       if (backupData.config) setConfig(backupData.config);
 
-      persistLocally(backupData.assets, backupData.handovers, backupData.logs, backupData.config);
-
       try {
-        await fetch('/api/restore-backup', {
+        const response = await apiFetch('/api/restore-backup', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            data: backupData,
-            pin: config.adminPin || ''
-          })
+          body: JSON.stringify({ data: backupData })
         });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        persistLocally(backupData.assets, backupData.handovers, backupData.logs, backupData.config);
       } catch (e) {
         console.warn('Backend restore notice:', e);
+        setAssets(assets);
+        setHandovers(handovers);
+        setLogs(logs);
+        setConfig(config);
+        persistLocally(assets, handovers, logs, config);
+        showToast('Gagal memulihkan backup ke database cloud.');
+        return;
       }
       notifyChange();
       showToast('Data inventaris berhasil dipulihkan dari file backup!');
@@ -651,13 +704,6 @@ export default function App() {
         isSyncing={isSyncing}
       />
 
-      {/* PIN Modal */}
-      <PinModal
-        isOpen={isPinModalOpen}
-        onClose={() => setIsPinModalOpen(false)}
-        onSuccess={handlePinSuccess}
-        configuredPin={config.adminPin}
-      />
 
       {/* Delete Confirmation Modal */}
       <DeleteModal
@@ -724,31 +770,12 @@ export default function App() {
 
             {/* Admin PIN Lock Button */}
             <button
-              onClick={() => {
-                if (isPinAuthenticated) {
-                  setIsPinAuthenticated(false);
-                  showToast('Sesi Admin dikunci.');
-                } else {
-                  setIsPinModalOpen(true);
-                }
-              }}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold border transition ${
-                isPinAuthenticated
-                  ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
-                  : 'bg-slate-800 text-slate-300 border-slate-700 hover:text-white hover:border-orange-500/50'
-              }`}
+              onClick={onSignOut}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold border bg-slate-800 text-slate-300 border-slate-700 hover:text-white hover:border-orange-500/50 transition"
+              title="Keluar dari sesi admin"
             >
-              {isPinAuthenticated ? (
-                <>
-                  <Unlock className="h-3.5 w-3.5 text-emerald-400" />
-                  <span className="hidden sm:inline">Admin Aktif</span>
-                </>
-              ) : (
-                <>
-                  <Lock className="h-3.5 w-3.5" />
-                  <span className="hidden sm:inline">Kunci PIN</span>
-                </>
-              )}
+              <Lock className="h-3.5 w-3.5" />
+              <span className="hidden sm:inline">Keluar</span>
             </button>
           </div>
         </div>
@@ -843,8 +870,7 @@ export default function App() {
               <AssetDetail
                 asset={currentSelectedAsset}
                 handovers={handovers}
-                isAdmin={isPinAuthenticated}
-                onRequestAdminLogin={() => setIsPinModalOpen(true)}
+                isAdmin={isAdminSession}
                 onStartHandover={() => {
                   executeWithPinGuard(() => changeAppScreen('handover'));
                 }}
@@ -902,8 +928,7 @@ export default function App() {
               <AssetDetail
                 asset={currentSelectedAsset}
                 handovers={handovers}
-                isAdmin={isPinAuthenticated}
-                onRequestAdminLogin={() => setIsPinModalOpen(true)}
+                isAdmin={isAdminSession}
                 onStartHandover={() => {
                   executeWithPinGuard(() => changeAppScreen('handover'));
                 }}

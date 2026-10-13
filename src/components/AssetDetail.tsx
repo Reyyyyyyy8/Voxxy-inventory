@@ -32,7 +32,6 @@ interface AssetDetailProps {
   asset: Asset;
   handovers: HandoverRecord[];
   isAdmin?: boolean;
-  onRequestAdminLogin?: () => void;
   onStartHandover: () => void;
   onReturnAsset: () => void;
   onEditAsset: () => void;
@@ -44,7 +43,6 @@ export const AssetDetail: React.FC<AssetDetailProps> = ({
   asset,
   handovers,
   isAdmin = false,
-  onRequestAdminLogin,
   onStartHandover,
   onReturnAsset,
   onEditAsset,
@@ -190,16 +188,8 @@ export const AssetDetail: React.FC<AssetDetailProps> = ({
           <div className="p-3 rounded-2xl bg-slate-950/60 border border-slate-800 text-xs text-slate-300 flex items-center justify-between gap-2">
             <div className="flex items-center gap-2 text-slate-400 text-[11px]">
               <ShieldCheck className="h-4 w-4 text-orange-400 shrink-0" />
-              <span>Aksi Edit, Hapus & Serah Terima diproteksi PIN admin yang dikonfigurasi.</span>
+              <span>Aksi admin hanya tersedia untuk akun Google yang diizinkan.</span>
             </div>
-            {onRequestAdminLogin && (
-              <button
-                onClick={onRequestAdminLogin}
-                className="text-[11px] text-orange-400 hover:text-orange-300 font-bold underline shrink-0"
-              >
-                Buka Kunci PIN
-              </button>
-            )}
           </div>
         ) : null}
 
