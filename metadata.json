@@ -1,0 +1,10 @@
+{
+  "name": "Sistem Inventory & Handover Aset Kantor",
+  "description": "Sistem pendataan aset kantor dengan QR Code, serah terima laptop (handover), tanda tangan digital, dan integrasi Google Sheets.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
